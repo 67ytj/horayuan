@@ -1,3 +1,11 @@
 name: AllegroHandGrasp
 defaults:
   - AllegroHandHora
+env:
+  # Higher threshold for grasp generation: only record a grasp as successful if
+  # the ball is held near the hand's palm height (prevents weak or incidental contacts).
+  reset_height_threshold: 0.645
+  genGrasps: True
+  object:
+    type: 'simple_tennis_ball'
+    sampleProb: [1.0]

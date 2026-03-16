@@ -1,3 +1,9 @@
 name: PublicAllegroHandGrasp
 defaults:
   - PublicAllegroHandHora
+env:
+  reset_height_threshold: 0.625
+  genGrasps: True
+  object:
+    type: 'simple_tennis_ball'
+    sampleProb: [1.0]

@@ -24,7 +24,9 @@ env:
 
   clipObservations: 5.0
   clipActions: 1.0
-  reset_height_threshold: 0.645
+  # Lower threshold allows ball to drop during initial training without immediately resetting;
+  # the reward (lift_reward) drives the agent to hold the ball above the hand's resting height.
+  reset_height_threshold: 0.2
   grasp_cache_name: 'internal_allegro'
 
   # Random forces applied to the object
@@ -38,13 +40,21 @@ env:
     privInfoDim: 9
 
   reward:
-    angvelClipMin: -0.5
-    angvelClipMax: 0.5
-    rotateRewardScale: 1.0
-    objLinvelPenaltyScale: -0.3
-    poseDiffPenaltyScale: -0.3
+    # Fingertip proximity reward (from Fungrasp pos_reward, coeff=2.0)
+    fingertipRewardScale: 2.0
+    # Contact reward: normalized finger-ball contacts (from Fungrasp contact_reward, coeff=1.0)
+    contactRewardScale: 1.0
+    # Lift reward: contacts * height above threshold (from Fungrasp impulse_reward, coeff=2.0)
+    liftRewardScale: 2.0
+    # Object linear velocity penalty (from Fungrasp rel_obj_reward_, coeff=-1.0)
+    objLinvelPenaltyScale: -1.0
+    # Torque penalty (from Fungrasp torque)
     torquePenaltyScale: -0.1
-    workPenaltyScale: -2.0
+    # Work/velocity penalty (from Fungrasp body_vel_reward_ + body_qvel_reward_, combined coeff=-0.5)
+    workPenaltyScale: -0.5
+    # Contact detection threshold: ball_radius(0.04) + margin(0.02) = 0.06 m
+    # Matches Fungrasp thresd_cos=0.866 philosophy of proximity threshold
+    contactThreshold: 0.06
 
   baseObjScale: 0.8
   randomization:
@@ -58,12 +68,12 @@ env:
     randomizeFriction: True
     randomizeFrictionLower: 0.3
     randomizeFrictionUpper: 3.0
-    randomizeScale: True
-    # if scale_list_init is True, randomizeScaleLower and randomizeScaleUpper is not useful
-    scaleListInit: True
-    randomizeScaleList: [0.7, 0.72, 0.74, 0.76, 0.78, 0.8, 0.82, 0.84, 0.86]
-    randomizeScaleLower: 0.75  # only useful when not scaleListInit
-    randomizeScaleUpper: 0.8  # only useful when not scaleListInit
+    randomizeScale: False
+    # scaleListInit disabled for ball grasping; set True only when grasp cache is available
+    scaleListInit: False
+    randomizeScaleList: [0.8]
+    randomizeScaleLower: 0.75
+    randomizeScaleUpper: 0.8
     randomizePDGains: True
     randomizePGainLower: 2.9
     randomizePGainUpper: 3.1
@@ -79,7 +89,7 @@ env:
     enableObjFriction: True
 
   object:
-    type: 'block' # can be block, egg or pen
+    type: 'simple_tennis_ball'
     sampleProb: [1.0]
 
   asset:
