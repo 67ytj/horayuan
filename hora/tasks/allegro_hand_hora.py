@@ -10,7 +10,7 @@ import torch
 import numpy as np
 from isaacgym import gymtorch
 from isaacgym import gymapi
-from isaacgym.torch_utils import to_torch, unscale, quat_apply, tensor_clamp, torch_rand_float, quat_conjugate, quat_mul
+from isaacgym.torch_utils import to_torch, unscale, quat_apply, tensor_clamp, torch_rand_float
 from glob import glob
 from hora.utils.misc import tprint
 from .base.vec_task import VecTask
@@ -90,13 +90,23 @@ class AllegroHandHora(VecTask):
         if self.randomize_scale and self.scale_list_init:
             self.saved_grasping_states = {}
             for s in self.randomize_scale_list:
-                self.saved_grasping_states[str(s)] = torch.from_numpy(np.load(
-                    f'cache/{self.grasp_cache_name}_grasp_50k_s{str(s).replace(".", "")}.npy'
-                )).float().to(self.device)
+                cache_file = f'cache/{self.grasp_cache_name}_grasp_50k_s{str(s).replace(".", "")}.npy'
+                if os.path.exists(cache_file):
+                    self.saved_grasping_states[str(s)] = torch.from_numpy(np.load(cache_file)).float().to(self.device)
+            self.use_grasp_cache = len(self.saved_grasping_states) > 0
         else:
-            assert self.save_init_pose
+            self.use_grasp_cache = False
 
         self.rot_axis_buf = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float)
+
+        # fingertip rigid body indices for Allegro hand (used for contact detection)
+        self.fingertip_handles = [4, 8, 12, 16]
+
+        # canonical grasp pose used as fallback when no pre-generated grasp cache exists
+        self.canonical_pose = [
+            0.082, 1.244, 0.265, 0.298, 1.104, 1.163, 0.953, -0.138,
+            0.005, 1.096, 0.080, 0.150, 0.029, 1.337, 0.285, 0.317,
+        ]
 
         # useful buffers
         self.object_rot_prev = self.object_rot.clone()
@@ -259,23 +269,37 @@ class AllegroHandHora(VecTask):
         # reset rigid body forces
         self.rb_forces[env_ids, :, :] = 0.0
 
-        num_scales = len(self.randomize_scale_list)
-        for n_s in range(num_scales):
-            s_ids = env_ids[(env_ids % num_scales == n_s).nonzero(as_tuple=False).squeeze(-1)]
-            if len(s_ids) == 0:
-                continue
-            obj_scale = self.randomize_scale_list[n_s]
-            scale_key = str(obj_scale)
-            sampled_pose_idx = np.random.randint(self.saved_grasping_states[scale_key].shape[0], size=len(s_ids))
-            sampled_pose = self.saved_grasping_states[scale_key][sampled_pose_idx].clone()
-            self.root_state_tensor[self.object_indices[s_ids], :7] = sampled_pose[:, 16:]
-            self.root_state_tensor[self.object_indices[s_ids], 7:13] = 0
-            pos = sampled_pose[:, :16]
-            self.allegro_hand_dof_pos[s_ids, :] = pos
-            self.allegro_hand_dof_vel[s_ids, :] = 0
-            self.prev_targets[s_ids, :self.num_allegro_hand_dofs] = pos
-            self.cur_targets[s_ids, :self.num_allegro_hand_dofs] = pos
-            self.init_pose_buf[s_ids, :] = pos.clone()
+        if self.use_grasp_cache:
+            num_scales = len(self.randomize_scale_list)
+            for n_s in range(num_scales):
+                s_ids = env_ids[(env_ids % num_scales == n_s).nonzero(as_tuple=False).squeeze(-1)]
+                if len(s_ids) == 0:
+                    continue
+                obj_scale = self.randomize_scale_list[n_s]
+                scale_key = str(obj_scale)
+                sampled_pose_idx = np.random.randint(self.saved_grasping_states[scale_key].shape[0], size=len(s_ids))
+                sampled_pose = self.saved_grasping_states[scale_key][sampled_pose_idx].clone()
+                self.root_state_tensor[self.object_indices[s_ids], :7] = sampled_pose[:, 16:]
+                self.root_state_tensor[self.object_indices[s_ids], 7:13] = 0
+                pos = sampled_pose[:, :16]
+                self.allegro_hand_dof_pos[s_ids, :] = pos
+                self.allegro_hand_dof_vel[s_ids, :] = 0
+                self.prev_targets[s_ids, :self.num_allegro_hand_dofs] = pos
+                self.cur_targets[s_ids, :self.num_allegro_hand_dofs] = pos
+                self.init_pose_buf[s_ids, :] = pos.clone()
+        else:
+            # No grasp cache: reset object to initial pose and hand to canonical pose
+            self.root_state_tensor[self.object_indices[env_ids]] = self.object_init_state[env_ids].clone()
+            self.root_state_tensor[self.object_indices[env_ids], 7:13] = 0
+            rand_floats = torch_rand_float(-1.0, 1.0, (len(env_ids), self.num_allegro_hand_dofs), device=self.device)
+            pos = to_torch(self.canonical_pose, device=self.device)[None].repeat(len(env_ids), 1)
+            pos = pos + 0.1 * rand_floats
+            pos = tensor_clamp(pos, self.allegro_hand_dof_lower_limits, self.allegro_hand_dof_upper_limits)
+            self.allegro_hand_dof_pos[env_ids, :] = pos
+            self.allegro_hand_dof_vel[env_ids, :] = 0
+            self.prev_targets[env_ids, :self.num_allegro_hand_dofs] = pos
+            self.cur_targets[env_ids, :self.num_allegro_hand_dofs] = pos
+            self.init_pose_buf[env_ids, :] = pos.clone()
 
         object_indices = torch.unique(self.object_indices[env_ids]).to(torch.int32)
         self.gym.set_actor_root_state_tensor_indexed(self.sim, gymtorch.unwrap_tensor(self.root_state_tensor), gymtorch.unwrap_tensor(object_indices), len(object_indices))
@@ -319,42 +343,55 @@ class AllegroHandHora(VecTask):
         self._update_priv_buf(env_id=range(self.num_envs), name='obj_position', value=self.object_pos.clone())
 
     def compute_reward(self, actions):
-        self.rot_axis_buf[:, -1] = -1
-        # pose diff penalty
-        pose_diff_penalty = ((self.allegro_hand_dof_pos - self.init_pose_buf) ** 2).sum(-1)
-        # work and torque penalty
-        torque_penalty = (self.torques ** 2).sum(-1)
-        work_penalty = ((self.torques * self.dof_vel_finite_diff).sum(-1)) ** 2
-        # Compute offset in radians. Radians -> radians / sec
-        angdiff = quat_to_axis_angle(quat_mul(self.object_rot, quat_conjugate(self.object_rot_prev)))
-        object_angvel = angdiff / (self.control_freq_inv * self.dt)
-        vec_dot = (object_angvel * self.rot_axis_buf).sum(-1)
-        rotate_reward = torch.clip(vec_dot, max=self.angvel_clip_max, min=self.angvel_clip_min)
-        # linear velocity: use position difference instead of self.object_linvel
-        object_linvel = ((self.object_pos - self.object_pos_prev) / (self.control_freq_inv * self.dt)).clone()
-        object_linvel_penalty = torch.norm(object_linvel, p=1, dim=-1)
+        # Fingertip positions (Allegro hand fingertip rigid body indices: 4, 8, 12, 16)
+        finger_pos = self.rigid_body_states[:, self.fingertip_handles, :3]  # (N, 4, 3)
+        obj_pos = self.object_pos  # (N, 3)
 
-        self.rew_buf[:] = compute_hand_reward(
-            object_linvel_penalty, self.object_linvel_penalty_scale,
-            rotate_reward, self.rotate_reward_scale,
-            pose_diff_penalty, self.pose_diff_penalty_scale,
+        # Fingertip-to-object distances (inspired by Fungrasp pos_reward, scale=2.0)
+        # Reward for moving fingertips close to the ball
+        fingertip_dist = torch.norm(finger_pos - obj_pos.unsqueeze(1), p=2, dim=-1)  # (N, 4)
+        fingertip_reward = -fingertip_dist.mean(-1)  # negative mean distance, maximize closeness
+
+        # Contact reward: fingertips within contact_threshold of the ball (inspired by Fungrasp contact_reward, scale=1.0)
+        # contact_threshold ~= ball_radius(0.04) + fingertip margin(0.02)
+        near_contact = (fingertip_dist < self.contact_threshold).float()  # (N, 4)
+        contact_count = near_contact.sum(-1)  # (N,) - number of fingers near ball
+        contact_reward = contact_count / 4.0  # normalized to [0, 1]
+
+        # Lift reward: reward for holding the ball above initial height while in contact
+        # Inspired by Fungrasp impulse_reward (maintaining grip force), scale=2.0
+        lift_height = torch.clamp(obj_pos[:, 2] - self.reset_z_threshold, min=0.0)  # height above threshold
+        lift_reward = contact_count * lift_height  # reward grasping + lifting
+
+        # Object linear velocity penalty (from Fungrasp rel_obj_reward_, coeff=-1.0)
+        obj_linvel_penalty = (self.object_linvel ** 2).sum(-1)
+
+        # Torque penalty (from Fungrasp torque)
+        torque_penalty = (self.torques ** 2).sum(-1)
+
+        # Work penalty (from Fungrasp body_vel_reward_ + body_qvel_reward_, combined coeff=-0.5)
+        work_penalty = ((self.torques * self.dof_vel_finite_diff).sum(-1)) ** 2
+
+        self.rew_buf[:] = compute_hand_grasp_reward(
+            fingertip_reward, self.fingertip_reward_scale,
+            contact_reward, self.contact_reward_scale,
+            lift_reward, self.lift_reward_scale,
+            obj_linvel_penalty, self.obj_linvel_penalty_scale,
             torque_penalty, self.torque_penalty_scale,
             work_penalty, self.work_penalty_scale,
         )
         self.reset_buf[:] = self.check_termination(self.object_pos)
-        self.extras['rotation_reward'] = rotate_reward.mean()
-        self.extras['object_linvel_penalty'] = object_linvel_penalty.mean()
-        self.extras['pose_diff_penalty'] = pose_diff_penalty.mean()
+        self.extras['contact_reward'] = contact_reward.mean()
+        self.extras['fingertip_reward'] = fingertip_reward.mean()
+        self.extras['lift_reward'] = lift_reward.mean()
+        self.extras['obj_linvel_penalty'] = obj_linvel_penalty.mean()
         self.extras['work_done'] = work_penalty.mean()
         self.extras['torques'] = torque_penalty.mean()
-        self.extras['roll'] = object_angvel[:, 0].mean()
-        self.extras['pitch'] = object_angvel[:, 1].mean()
-        self.extras['yaw'] = object_angvel[:, 2].mean()
 
         if self.evaluate:
             finished_episode_mask = self.reset_buf == 1
             self.stat_sum_rewards += self.rew_buf.sum()
-            self.stat_sum_rotate_rewards += rotate_reward.sum()
+            self.stat_sum_rotate_rewards += contact_reward.sum()
             self.stat_sum_torques += self.torques.abs().sum()
             self.stat_sum_obj_linvel += (self.object_linvel ** 2).sum(-1).sum()
             self.stat_sum_episode_length += (self.reset_buf == 0).sum()
@@ -363,8 +400,8 @@ class AllegroHandHora(VecTask):
             info = f'progress {self.env_evaluated} / {self.max_evaluate_envs} | ' \
                    f'reward: {self.stat_sum_rewards / self.env_evaluated:.2f} | ' \
                    f'eps length: {self.stat_sum_episode_length / self.env_evaluated:.2f} | ' \
-                   f'rotate reward: {self.stat_sum_rotate_rewards / self.env_evaluated:.2f} | ' \
-                   f'lin vel (x100): {self.stat_sum_obj_linvel * 100 / self.stat_sum_episode_length:.4f} | ' \
+                   f'contact reward: {self.stat_sum_rotate_rewards / self.env_evaluated:.2f} | ' \
+                   f'obj linvel (x100): {self.stat_sum_obj_linvel * 100 / self.stat_sum_episode_length:.4f} | ' \
                    f'command torque: {self.stat_sum_torques / self.stat_sum_episode_length:.2f}'
             tprint(info)
             if self.env_evaluated >= self.max_evaluate_envs:
@@ -553,13 +590,13 @@ class AllegroHandHora(VecTask):
         self.proprio_hist_buf = torch.zeros((num_envs, self.prop_hist_len, 32), device=self.device, dtype=torch.float)
 
     def _setup_reward_config(self, r_config):
-        self.angvel_clip_min = r_config['angvelClipMin']
-        self.angvel_clip_max = r_config['angvelClipMax']
-        self.rotate_reward_scale = r_config['rotateRewardScale']
-        self.object_linvel_penalty_scale = r_config['objLinvelPenaltyScale']
-        self.pose_diff_penalty_scale = r_config['poseDiffPenaltyScale']
+        self.fingertip_reward_scale = r_config['fingertipRewardScale']
+        self.contact_reward_scale = r_config['contactRewardScale']
+        self.lift_reward_scale = r_config['liftRewardScale']
+        self.obj_linvel_penalty_scale = r_config['objLinvelPenaltyScale']
         self.torque_penalty_scale = r_config['torquePenaltyScale']
         self.work_penalty_scale = r_config['workPenaltyScale']
+        self.contact_threshold = r_config.get('contactThreshold', 0.06)
 
     def _create_object_asset(self):
         # object file to asset
@@ -568,7 +605,7 @@ class AllegroHandHora(VecTask):
         # load hand asset
         hand_asset_options = gymapi.AssetOptions()
         hand_asset_options.flip_visual_attachments = False
-        hand_asset_options.fix_base_link = True
+        hand_asset_options.fix_base_link = False  # allow base to move freely for grasping task
         hand_asset_options.collapse_fixed_joints = True
         hand_asset_options.disable_gravity = True
         hand_asset_options.thickness = 0.001
@@ -616,48 +653,24 @@ class AllegroHandHora(VecTask):
         return allegro_hand_start_pose, object_start_pose
 
 
-def compute_hand_reward(
-    object_linvel_penalty, object_linvel_penalty_scale: float,
-    rotate_reward, rotate_reward_scale: float,
-    pose_diff_penalty, pose_diff_penalty_scale: float,
+def compute_hand_grasp_reward(
+    fingertip_reward, fingertip_reward_scale: float,
+    contact_reward, contact_reward_scale: float,
+    lift_reward, lift_reward_scale: float,
+    obj_linvel_penalty, obj_linvel_penalty_scale: float,
     torque_penalty, torque_pscale: float,
     work_penalty, work_pscale: float,
 ):
-    reward = rotate_reward_scale * rotate_reward
-    # Distance from the hand to the object
-    reward = reward + object_linvel_penalty * object_linvel_penalty_scale
-    reward = reward + pose_diff_penalty * pose_diff_penalty_scale
-    reward = reward + torque_penalty * torque_pscale
-    reward = reward + work_penalty * work_pscale
+    # Fingertip proximity reward (from Fungrasp pos_reward, scale=2.0)
+    reward = fingertip_reward_scale * fingertip_reward
+    # Contact reward: normalized number of fingertips touching ball (from Fungrasp contact_reward, scale=1.0)
+    reward = reward + contact_reward_scale * contact_reward
+    # Lift reward: reward for holding ball above threshold (from Fungrasp impulse_reward, scale=2.0)
+    reward = reward + lift_reward_scale * lift_reward
+    # Object velocity penalty (from Fungrasp rel_obj_reward_, coeff=-1.0)
+    reward = reward + obj_linvel_penalty_scale * obj_linvel_penalty
+    # Torque penalty (from Fungrasp torque)
+    reward = reward + torque_pscale * torque_penalty
+    # Work penalty (from Fungrasp body_vel_reward_ + body_qvel_reward_, combined coeff=-0.5)
+    reward = reward + work_pscale * work_penalty
     return reward
-
-
-def quat_to_axis_angle(quaternions: torch.Tensor) -> torch.Tensor:
-    """
-    Convert rotations given as quaternions to axis/angle.
-    Adapted from PyTorch3D:
-    https://pytorch3d.readthedocs.io/en/latest/_modules/pytorch3d/transforms/rotation_conversions.html#quaternion_to_axis_angle
-    Args:
-        quaternions: quaternions with real part last,
-            as tensor of shape (..., 4).
-    Returns:
-        Rotations given as a vector in axis angle form, as a tensor
-            of shape (..., 3), where the magnitude is the angle
-            turned anticlockwise in radians around the vector's
-            direction.
-    """
-    norms = torch.norm(quaternions[..., :3], p=2, dim=-1, keepdim=True)
-    half_angles = torch.atan2(norms, quaternions[..., 3:])
-    angles = 2 * half_angles
-    eps = 1e-6
-    small_angles = angles.abs() < eps
-    sin_half_angles_over_angles = torch.empty_like(angles)
-    sin_half_angles_over_angles[~small_angles] = (
-        torch.sin(half_angles[~small_angles]) / angles[~small_angles]
-    )
-    # for x small, sin(x/2) is about x/2 - (x/2)^3/6
-    # so sin(x/2)/x is about 1/2 - (x*x)/48
-    sin_half_angles_over_angles[small_angles] = (
-        0.5 - (angles[small_angles] * angles[small_angles]) / 48
-    )
-    return quaternions[..., :3] / sin_half_angles_over_angles
